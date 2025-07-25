@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: e-ocr
+    runtime: python
+    pythonVersion: 3.10
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn config.wsgi
+    envVars:
+      - key: DJANGO_SETTINGS_MODULE
+        value: config.settings
+    plan: free
