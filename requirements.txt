@@ -5,4 +5,4 @@ pillow
 numpy
 opencv-python-headless
 paddleocr
-paddlepaddle==2.5.1
+paddlepaddle
