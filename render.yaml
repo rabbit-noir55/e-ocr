@@ -1,12 +1,13 @@
 services:
   - type: web
     name: e-ocr
-    env: python           # Bu muhim!
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    pythonVersion: 3.10
+    buildCommand: |
+      apt-get update && apt-get install -y libgl1
+      pip install -r requirements.txt
     startCommand: gunicorn config.wsgi
-    pythonVersion: 3.10   # Aynan bu yerda ishlaydi
-    plan: free
     envVars:
       - key: DJANGO_SETTINGS_MODULE
         value: config.settings
+    plan: free
