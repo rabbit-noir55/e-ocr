@@ -1,113 +1,154 @@
-# ocr_utils.py
-import cv2
-import numpy as np
-from PIL import Image, ImageOps
+from rest_framework.parsers import MultiPartParser, FormParser
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework import status
 import logging
-import re
+import time
+from functools import wraps
 
+# Logger sozlash
 logger = logging.getLogger(__name__)
 
-# Rasmni tozalash parametrlari
-DEFAULT_TARGET_HEIGHT = 64
-DEFAULT_TARGET_WIDTH = 320
-GAUSSIAN_BLUR_KERNEL = (5, 5)
+# Sozlamalar
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5MB
+ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png']
+MAX_PROCESSING_TIME = 10  # soniya
+REQUEST_TIMEOUT = 30  # soniya
 
-def clean_string(input_str):
-    """Faqat raqamlarni qoldirish"""
-    return re.sub(r'[^0-9]', '', input_str)
+# Xatolarni ushlash uchun dekorator
+def handle_errors(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except ValueError as e:
+            logger.warning(f"Noto'g'ri qiymat: {str(e)}")
+            raise
+        except IOError as e:
+            logger.error(f"IO xatolik: {str(e)}")
+            raise
+        except Exception as e:
+            logger.critical(f"Kutilmagan xatolik: {str(e)}", exc_info=True)
+            raise
+    return wrapper
 
-def remove_noise_and_clean(image_array):
-    """
-    Rasm shovqinini olib tashlash va tozalash
-    :param image_array: NumPy array ko'rinishidagi rasm
-    :return: Tozalangan rasm (NumPy array)
-    """
-    try:
-        # RGB dan GrayScale ga o'tkazish
-        gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+# Vaqt cheklovi dekoratori
+def timeout_handler(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        start_time = time.time()
+        result = func(*args, **kwargs)
+        processing_time = time.time() - start_time
         
-        # Gauss filtri bilan silliqlash
-        blurred = cv2.GaussianBlur(gray, GAUSSIAN_BLUR_KERNEL, 0)
+        if processing_time > MAX_PROCESSING_TIME:
+            logger.warning(f"Funksiya {func.__name__} {processing_time:.2f} soniyada yakunlandi")
         
-        # Otsu's thresholding
-        _, thresholded = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        # GrayScale dan RGB ga qaytarish
-        final_img = cv2.cvtColor(thresholded, cv2.COLOR_GRAY2RGB)
-        
-        return final_img
-    except Exception as e:
-        logger.error(f"Rasmni tozalashda xatolik: {str(e)}", exc_info=True)
-        raise
+        return result
+    return wrapper
 
-def preprocess_image(image_file, target_height=None, target_width=None):
-    """
-    Rasmni OCR uchun tayyorlash
-    :param image_file: Upload qilingan rasm fayli
-    :param target_height: Maqsadli balandlik
-    :param target_width: Maqsadli kenglik
-    :return: Qayta ishlangan rasm (NumPy array)
-    """
-    target_height = target_height or DEFAULT_TARGET_HEIGHT
-    target_width = target_width or DEFAULT_TARGET_WIDTH
+class ImageUploadView(APIView):
+    parser_classes = (MultiPartParser, FormParser)
     
-    try:
-        # PIL Image ochish
-        pil_image = Image.open(image_file)
-        
-        # RGBA yoki P formatdagi rasmlarni RGB ga o'tkazish
-        if pil_image.mode in ['RGBA', 'P', 'L']:
-            pil_image = pil_image.convert('RGB')
-        
-        # Rasm o'lchamini standartlashtirish
-        pil_image = ImageOps.pad(
-            pil_image, 
-            (target_width, target_height), 
-            color=(255, 255, 255),  # oq fon
-            centering=(0.5, 0.5))
-        
-        # NumPy array ga o'tkazish
-        img_array = np.array(pil_image)
-        
-        # Shovqinni olib tashlash
-        cleaned_img = remove_noise_and_clean(img_array)
-        
-        return cleaned_img
-    except Exception as e:
-        logger.error(f"Rasmni qayta ishlashda xatolik: {str(e)}", exc_info=True)
-        raise
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._validate_environment()
 
-def captcha_text(image_file):
-    """
-    CAPTCHA rasmidan matnni ajratib olish
-    :param image_file: Upload qilingan rasm fayli
-    :return: Tozalangan matn (faqat raqamlar)
-    """
-    try:
-        # PaddleOCR importi faqat kerak bo'lganda
-        from paddleocr import PaddleOCR
+    def _validate_environment(self):
+        """Server muhitini tekshirish"""
+        try:
+            import cv2
+            import numpy as np
+            from PIL import Image, ImageOps
+        except ImportError as e:
+            logger.critical(f"Kerakli kutubxona yo'q: {str(e)}")
+            raise ImportError("Kerakli tasvir qayta ishlash kutubxonalari o'rnatilmagan")
+
+    @handle_errors
+    def validate_image(self, image):
+        """Rasmni tekshirish"""
+        if not image:
+            raise ValueError("Rasm fayli topilmadi")
         
-        # Rasmni tayyorlash
-        processed_img = preprocess_image(image_file)
+        if image.size > MAX_IMAGE_SIZE:
+            raise ValueError(
+                f"Rasm hajmi {image.size//1024//1024}MB, "
+                f"ruxsat etilgan maksimum {MAX_IMAGE_SIZE//1024//1024}MB"
+            )
         
-        # OCR modelini yaratish
-        ocr = PaddleOCR(
-            use_doc_orientation_classify=False,
-            use_doc_unwarping=False,
-            use_textline_orientation=False
-        )
+        if image.content_type not in ALLOWED_IMAGE_TYPES:
+            raise ValueError(
+                f"Rasm formati {image.content_type} qo'llab-quvvatlanmaydi. "
+                f"Faqat {', '.join(ALLOWED_IMAGE_TYPES)} formatlari qo'llab-quvvatlanadi"
+            )
         
-        # Matnni aniqlash
-        result = ocr.predict(processed_img)
+        # Fayl nomini tekshirish
+        if not image.name.lower().endswith(('.jpg', '.jpeg', '.png')):
+            raise ValueError("Noto'g'ri fayl kengaytmasi")
+
+    @timeout_handler
+    @handle_errors
+    def process_request(self, image):
+        """So'rovni qayta ishlash"""
+        from .ocr_utils import captcha_text  # OCR funksiyasi alohida modulda
         
-        # Natijalarni tozalash
-        cleaned_text = clean_string(' '.join([res['rec_texts'][0] for res in result]))
+        start_time = time.time()
+        result = captcha_text(image)
+        processing_time = time.time() - start_time
         
-        if not cleaned_text:
-            logger.warning("CAPTCHA matni aniqlanmadi")
-            return ""
+        if processing_time > MAX_PROCESSING_TIME:
+            logger.warning(f"OCR jarayoni {processing_time:.2f} soniyada yakunlandi")
+        
+        if not result:
+            raise ValueError("CAPTCHA matni aniqlanmadi")
+        
+        return result
+
+    def post(self, request, format=None):
+        try:
+            # So'rov vaqtini tekshirish
+            if hasattr(request, 'start_time') and time.time() - request.start_time > REQUEST_TIMEOUT:
+                raise TimeoutError("So'rov muddati tugadi")
+
+            image = request.FILES.get('image')
             
-        return cleaned_text
-    except Exception as e:
-        logger.error(f"CAPTCHA tahlil qilishda xatolik: {str(e)}", exc_info=True)
-        raise
+            # Rasmni tekshirish
+            self.validate_image(image)
+            
+            # OCR jarayoni
+            text = self.process_request(image)
+            
+            logger.info(
+                f"CAPTCHA muvaffaqiyatli tahlil qilindi. "
+                f"Fayl: {image.name}, Hajmi: {image.size} bayt, Natija: {text}"
+            )
+            
+            return Response({"message": text}, status=status.HTTP_200_OK)
+
+        except ValueError as e:
+            logger.warning(f"Noto'g'ri so'rov: {str(e)}")
+            return Response(
+                {"error": str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except TimeoutError as e:
+            logger.error(f"So'rov muddati tugadi: {str(e)}")
+            return Response(
+                {"error": "Ishlov berish uchun etarli vaqt yo'q"},
+                status=status.HTTP_408_REQUEST_TIMEOUT
+            )
+        except ImportError as e:
+            logger.critical(f"Kutubxona yetishmayapti: {str(e)}")
+            return Response(
+                {"error": "Server sozlamalarida muammo"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        except Exception as e:
+            logger.error(
+                f"CAPTCHA tahlil qilishda xatolik. "
+                f"Fayl: {image.name if image else 'N/A'}, Xatolik: {str(e)}",
+                exc_info=True
+            )
+            return Response(
+                {"error": "CAPTCHA tahlil qilinmadi"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
